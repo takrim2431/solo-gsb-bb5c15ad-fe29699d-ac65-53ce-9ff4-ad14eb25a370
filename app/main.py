@@ -34,6 +34,8 @@ from .models import (
     LagCorrelationResponse,
     ResampleRequest,
     ResampleResponse,
+    RunCyclesRequest,
+    RunCyclesResponse,
     SegmentStatusResponse,
     SegmentStatusUpdateRequest,
     SimplifyRequest,
@@ -43,6 +45,7 @@ from .models import (
     parse_timestamp,
 )
 from .resampling import epoch_microseconds, resample_series, whole_microseconds
+from .run_cycles import identify_run_cycles
 from .simplify import simplify_series
 from .trends import scan_trends
 
@@ -79,8 +82,13 @@ app = FastAPI(
         "候选端点连线使此前所有省略点误差不超过上限时即可省略，首次超限保留前一点作新锚；"
         "相邻采样间隔超过 max_gap_seconds 断段且两侧点均保留，误差上限为 0 时共线点仍可省略，"
         "返回保留点的原始索引 / 分段编号、压缩前后点数与回放最大绝对误差。"
+        "启停周期接口对设备模拟量读数做滞环状态机识别：初始关闭，连续 confirm_points 个"
+        "读数不低于开启上阈值才开启、连续 confirm_points 个读数不高于关闭下阈值才关闭，"
+        "切换时刻取连续序列首点；两阈值之间保持原状态并清空待确认计数；"
+        "相邻间隔超过 max_gap_seconds 在断档前末点截断开启段并从关闭态重启，"
+        "末尾仍开启也在末点截断，返回各开启段起止、持续秒数、结束原因与汇总。"
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -481,6 +489,42 @@ def simplify(req: SimplifyRequest) -> dict:
         values,
         original_indices,
         max_error=req.max_error,
+        max_gap_seconds=req.max_gap_seconds,
+        series_id=req.series_id,
+    )
+
+
+@app.post(
+    "/api/v1/run-cycles",
+    response_model=RunCyclesResponse,
+    tags=["启停周期"],
+)
+def run_cycles(req: RunCyclesRequest) -> dict:
+    """无状态设备模拟量启停周期识别（滞环阈值 + 连续确认 + 断档截断）。
+
+    - 初始视为关闭：连续 ``confirm_points`` 个读数 **≥ on_threshold** 才开启，
+      连续 ``confirm_points`` 个读数 **≤ off_threshold** 才关闭，切换时刻均取
+      该连续序列的**首点**时刻；
+    - 读数落在两阈值之间时保持原状态并清空待确认计数；
+    - 相邻读数间隔超过 ``max_gap_seconds`` 时在断档前末点截断开启段、
+      清空计数并从关闭态重启（等号不算断档）；
+    - 末尾仍开启的开启段在末点截断。
+
+    返回各开启段起止 / 持续秒数 / 结束原因（normal / gap_truncated /
+    end_truncated）、总开启时长与正常启停次数；无开启段时为空列表与零汇总。
+    非法阈值（on_threshold ≤ off_threshold）、确认点数、时间戳或非有限数值返回 422。
+    """
+    try:
+        timestamps, values = _prepare_series(req.points, label="points ")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return identify_run_cycles(
+        timestamps,
+        values,
+        on_threshold=req.on_threshold,
+        off_threshold=req.off_threshold,
+        confirm_points=req.confirm_points,
         max_gap_seconds=req.max_gap_seconds,
         series_id=req.series_id,
     )

@@ -1153,6 +1153,109 @@ def test_simplify_replay_error_within_tolerance() -> None:
     print("✓ 折线压缩：回放最大绝对误差不超过误差上限、压缩生效")
 
 
+def test_run_cycles_hysteresis_and_confirm() -> None:
+    """启停滞环：连续确认开启 / 关闭，切换时刻取连续序列首点，中间值清零待确认。"""
+    from app.run_cycles import identify_run_cycles
+
+    def run(values, conf=2, on=80.0, off=20.0, gap=300):
+        ts = [f"2026-09-25T00:{i:02d}:00+00:00" for i in range(len(values))]
+        return identify_run_cycles(
+            ts, values, on_threshold=on, off_threshold=off,
+            confirm_points=conf, max_gap_seconds=gap,
+        )
+
+    # 两个完整周期：高高低低…，开启 / 关闭时刻均取确认序列首点
+    r = run([90, 90, 10, 10, 90, 90, 10, 10])
+    assert r["segment_count"] == 2 and r["normal_cycle_count"] == 2
+    assert [s["start_index"] for s in r["segments"]] == [0, 4]
+    assert [s["end_index"] for s in r["segments"]] == [2, 6]
+    assert all(s["close_reason"] == "normal" for s in r["segments"])
+    assert r["total_on_duration_seconds"] == 240.0
+    assert [s["point_count"] for s in r["segments"]] == [3, 3]
+
+    # 阈值等号计入：v == on_threshold 可开启，v == off_threshold 可关闭
+    r = run([5, 80, 50, 20, 5], conf=1)
+    seg = r["segments"][0]
+    assert (seg["start_index"], seg["end_index"]) == (1, 3)
+    assert seg["duration_seconds"] == 120.0
+
+    # 关闭态中间值（两阈值之间）清空待确认高位计数：序列需从头重新累计
+    r = run([5, 90, 50, 90, 90, 90])
+    assert r["segments"][0]["start_index"] == 3
+
+    # 开启态中间值清空待确认低位计数：单次低值后插中间值，关闭时刻顺延
+    r = run([90, 90, 10, 50, 10, 10])
+    seg = r["segments"][0]
+    assert seg["close_reason"] == "normal" and seg["end_index"] == 4
+
+    # 连续确认点数=3：开启时刻仍是序列首点（i=0）
+    r = run([90, 90, 90], conf=3)
+    assert r["segments"][0]["start_index"] == 0
+    assert r["segments"][0]["close_reason"] == "end_truncated"
+
+    # 不足确认点数：无开启段，空列表 + 零汇总
+    r = run([90], conf=2)
+    assert r["segments"] == [] and r["segment_count"] == 0
+    assert r["total_on_duration_seconds"] == 0 and r["normal_cycle_count"] == 0
+    print("✓ 启停周期：滞环阈值、连续确认取首点与中间值清零正确")
+
+
+def test_run_cycles_gap_and_end_truncation() -> None:
+    """断档在末点截断开启段并从关闭态重启；等号不断档；末尾开启末点截断。"""
+    from app.run_cycles import identify_run_cycles
+
+    def run(values, ts, conf=2, gap=300):
+        return identify_run_cycles(
+            ts, values, on_threshold=80.0, off_threshold=20.0,
+            confirm_points=conf, max_gap_seconds=gap,
+        )
+
+    # 间隔恰好 == max_gap（5 分钟）不断档
+    ts_eq = [
+        "2026-09-25T00:00:00+00:00", "2026-09-25T00:01:00+00:00",
+        "2026-09-25T00:06:00+00:00", "2026-09-25T00:07:00+00:00",
+    ]
+    r = run([90, 90, 90, 90], ts_eq)
+    assert len(r["segments"]) == 1
+    assert r["segments"][0]["close_reason"] == "end_truncated"
+
+    # 间隔 301s > 300s：开启段在断档前末点截断；断档后重新确认开启，末尾再截断
+    ts_over = [
+        "2026-09-25T00:00:00+00:00", "2026-09-25T00:01:00+00:00",
+        "2026-09-25T00:06:01+00:00", "2026-09-25T00:07:01+00:00",
+    ]
+    r = run([90, 90, 90, 90], ts_over)
+    assert r["segment_count"] == 2
+    assert r["gap_truncated_count"] == 1 and r["end_truncated_count"] == 1
+    s0, s1 = r["segments"]
+    assert s0["close_reason"] == "gap_truncated"
+    assert s0["end_index"] == 1 and s0["gap_before_time"] == ts_over[2]
+    assert s0["gap_seconds"] == 301.0
+    assert s1["start_index"] == 2 and s1["close_reason"] == "end_truncated"
+    assert r["total_on_duration_seconds"] == 120.0  # 60s + 60s
+
+    # 关闭态遇到断档：不产生开启段，且断档前未确认完的高位计数被清空
+    ts_off = [
+        "2026-09-25T00:00:00+00:00", "2026-09-25T00:01:00+00:00",
+        "2026-09-25T01:00:00+00:00", "2026-09-25T01:01:00+00:00",
+    ]
+    r = run([5, 90, 90, 5], ts_off)
+    assert r["segments"] == []
+
+    # 断档打断待确认关闭计数（仅 1 个低值）：开启段按断档截断而非正常关闭
+    ts_low = [
+        "2026-09-25T00:00:00+00:00", "2026-09-25T00:01:00+00:00",
+        "2026-09-25T00:02:00+00:00", "2026-09-25T01:00:00+00:00",
+        "2026-09-25T01:01:00+00:00",
+    ]
+    r = run([90, 90, 10, 10, 10], ts_low)
+    assert len(r["segments"]) == 1
+    assert r["segments"][0]["close_reason"] == "gap_truncated"
+    assert r["segments"][0]["end_index"] == 2
+    assert r["normal_cycle_count"] == 0
+    print("✓ 启停周期：断档截断 / 等号边界 / 关闭态重启 / 末尾截断正确")
+
+
 def test_api_end_to_end(tmp_db: str = "/tmp/tsad_smoke.db") -> None:
     import os
 
@@ -2099,9 +2202,105 @@ def _exercise_api(client: "TestClient") -> None:
     )
     assert r.status_code == 422
 
+    # 无状态启停周期识别：正常关闭 + 断档截断 + 末尾截断
+    run_payload = {
+        "series_id": "test-run-cycles",
+        "on_threshold": 80.0,
+        "off_threshold": 15.0,
+        "confirm_points": 2,
+        "max_gap_seconds": 300,
+        "points": [
+            {"timestamp": "2026-09-25T00:00:00Z", "value": 2.0},
+            {"timestamp": "2026-09-25T00:01:00Z", "value": 85.0},
+            {"timestamp": "2026-09-25T00:02:00Z", "value": 86.0},
+            {"timestamp": "2026-09-25T00:07:00Z", "value": 50.0},
+            {"timestamp": "2026-09-25T00:08:00Z", "value": 10.0},
+            {"timestamp": "2026-09-25T00:09:00Z", "value": 9.0},
+            {"timestamp": "2026-09-25T00:10:00Z", "value": 87.0},
+            {"timestamp": "2026-09-25T00:11:00Z", "value": 91.0},
+            {"timestamp": "2026-09-25T03:00:00Z", "value": 88.0},
+            {"timestamp": "2026-09-25T03:01:00Z", "value": 90.0},
+        ],
+    }
+    r = client.post("/api/v1/run-cycles", json=run_payload)
+    assert r.status_code == 200, r.text
+    rb = r.json()
+    assert rb["series_id"] == "test-run-cycles"
+    assert rb["point_count"] == 10
+    assert rb["segment_count"] == 3
+    assert rb["normal_cycle_count"] == 1
+    assert rb["gap_truncated_count"] == 1 and rb["end_truncated_count"] == 1
+    s0, s1, s2 = rb["segments"]
+    assert s0["close_reason"] == "normal"
+    assert (s0["start_index"], s0["end_index"]) == (1, 4)
+    assert s0["start_time"] == "2026-09-25T00:01:00+00:00"
+    assert s0["end_time"] == "2026-09-25T00:08:00+00:00"
+    assert s0["duration_seconds"] == 420.0
+    assert s1["close_reason"] == "gap_truncated"
+    assert s1["end_index"] == 7 and s1["gap_before_time"] == "2026-09-25T03:00:00+00:00"
+    assert s1["gap_seconds"] == 10140.0
+    assert s2["close_reason"] == "end_truncated" and s2["duration_seconds"] == 60.0
+    assert rb["total_on_duration_seconds"] == 420.0 + 60.0 + 60.0
+
+    # 乱序提交：服务端排序后结果一致
+    r = client.post(
+        "/api/v1/run-cycles",
+        json={**run_payload, "points": list(reversed(run_payload["points"]))},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["segments"] == rb["segments"]
+
+    # 无开启段：空列表与零汇总
+    r = client.post(
+        "/api/v1/run-cycles",
+        json={**{k: run_payload[k] for k in
+                 ("on_threshold", "off_threshold", "confirm_points", "max_gap_seconds")},
+              "points": [{"timestamp": "2026-09-25T00:00:00Z", "value": 5.0}]},
+    )
+    assert r.status_code == 200, r.text
+    empty = r.json()
+    assert empty["segments"] == [] and empty["segment_count"] == 0
+    assert empty["total_on_duration_seconds"] == 0 and empty["normal_cycle_count"] == 0
+
+    # 参数校验：阈值非法 / 确认点数 / 间隔 / 点数 / 重复时间戳 / 时间戳 / 非有限
+    for field, value in [
+        ("on_threshold", 15.0), ("on_threshold", 10.0), ("off_threshold", 80.0),
+        ("confirm_points", 0), ("max_gap_seconds", 0), ("max_gap_seconds", -1),
+    ]:
+        bad = dict(run_payload)
+        bad[field] = value
+        r = client.post("/api/v1/run-cycles", json=bad)
+        assert r.status_code == 422, (field, value, r.text)
+    bad = dict(run_payload)
+    bad["points"] = []
+    assert client.post("/api/v1/run-cycles", json=bad).status_code == 422
+    bad = dict(run_payload)
+    bad["points"] = run_payload["points"] + [run_payload["points"][0]]
+    r = client.post("/api/v1/run-cycles", json=bad)
+    assert r.status_code == 422 and "重复时间戳" in r.text
+    bad = dict(run_payload)
+    bad["points"] = [{"timestamp": "not-a-time", "value": 1.0}]
+    assert client.post("/api/v1/run-cycles", json=bad).status_code == 422
+    for field, value in [("on_threshold", float("nan")), ("off_threshold", float("inf")),
+                         ("max_gap_seconds", float("inf"))]:
+        bad = dict(run_payload)
+        bad[field] = value
+        r = client.post(
+            "/api/v1/run-cycles", content=_json.dumps(bad),
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 422, (field, r.text)
+    bad = dict(run_payload)
+    bad["points"] = [{"timestamp": "2026-09-25T00:00:00Z", "value": float("nan")}]
+    r = client.post(
+        "/api/v1/run-cycles", content=_json.dumps(bad),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+
     print(
         "✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略 / "
-        "趋势扫描 / 时滞关联 / 事件聚合 / 无状态重采样 / 计数器速率 / 折线压缩"
+        "趋势扫描 / 时滞关联 / 事件聚合 / 无状态重采样 / 计数器速率 / 折线压缩 / 启停周期"
     )
 
 
@@ -2472,6 +2671,8 @@ if __name__ == "__main__":
     test_simplify_zero_error_collinear()
     test_simplify_gap_break_keeps_both_sides()
     test_simplify_replay_error_within_tolerance()
+    test_run_cycles_hysteresis_and_confirm()
+    test_run_cycles_gap_and_end_truncation()
     test_api_end_to_end()
     test_counter_series_archive_api()
     test_segment_status_workflow()

@@ -867,6 +867,102 @@ class CounterReadingsUpsertResponse(CounterSeriesResponse):
     model_config = ConfigDict(extra="ignore")
 
 
+class RunCyclesRequest(BaseModel):
+    """设备模拟量启停周期识别请求（无状态，滞环 + 连续确认）。"""
+
+    series_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="可选的业务序列标识，随响应回显",
+    )
+    points: list[PointIn] = Field(
+        min_length=1,
+        description=(
+            "带时间戳的模拟量读数（至少 1 个）；无需预先排序，"
+            "服务端自动排序并拒绝重复时间戳（422）"
+        ),
+    )
+    on_threshold: FiniteFloat = Field(
+        description="开启上阈值（有限数值）：连续 confirm_points 个读数不低于该值才开启"
+    )
+    off_threshold: FiniteFloat = Field(
+        description="关闭下阈值（有限数值）：连续 confirm_points 个读数不高于该值才关闭"
+    )
+    confirm_points: int = Field(
+        ge=1,
+        le=1_000_000,
+        description=(
+            "连续确认点数（≥1）：需要连续多少个读数达到对应阈值才切换状态；"
+            "取 1 时单个读数即触发切换"
+        ),
+    )
+    max_gap_seconds: FiniteFloat = Field(
+        gt=0,
+        description=(
+            "最大采样间隔（秒，**>0 且有限**）：相邻读数间隔超过该值即视为采样断档，"
+            "在断档前末点截断当前开启段、清空计数并从关闭态重启；间隔恰好等于阈值不算断档"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_thresholds(self) -> "RunCyclesRequest":
+        if self.on_threshold <= self.off_threshold:
+            raise ValueError(
+                f"on_threshold 必须大于 off_threshold"
+                f"（on_threshold={self.on_threshold}，off_threshold={self.off_threshold}）"
+            )
+        return self
+
+
+class RunCycleSegment(BaseModel):
+    """单个开启段（一次启停周期中的开启部分）。"""
+
+    index: int = Field(description="开启段序号（按时间顺序从 0 开始）")
+    start_index: int = Field(description="开启段起点（确认序列首点）在排序后序列中的索引")
+    end_index: int = Field(description="开启段终点在排序后序列中的索引")
+    start_time: str = Field(description="开启时刻（触发开启的连续序列首点时刻，UTC ISO-8601）")
+    end_time: str = Field(description="关闭/截断时刻（正常关闭取确认序列首点时刻，否则取截断末点时刻）")
+    point_count: int = Field(description="开启段覆盖的原始点数（起止索引之差 + 1）")
+    duration_seconds: float = Field(description="开启持续秒数（end_time − start_time）")
+    close_reason: Literal["normal", "gap_truncated", "end_truncated"] = Field(
+        description=(
+            "段结束原因：normal=连续达到确认点数的读数不高于下阈值，正常关闭；"
+            "gap_truncated=相邻采样间隔超过 max_gap_seconds，在断档前末点截断；"
+            "end_truncated=序列末尾仍处于开启状态，在末点截断"
+        )
+    )
+    close_reason_detail: str = Field(description="段结束原因的中文解释")
+    gap_before_time: str | None = Field(
+        default=None,
+        description="close_reason=gap_truncated 时断档后第一个读数的时刻；其余原因为 null",
+    )
+    gap_seconds: float | None = Field(
+        default=None,
+        description="close_reason=gap_truncated 时断档两侧的实际时间差（秒）；其余原因为 null",
+    )
+
+
+class RunCyclesResponse(BaseModel):
+    series_id: str | None = None
+    point_count: int = Field(description="排序后的读数点数")
+    on_threshold: float = Field(description="回显开启上阈值")
+    off_threshold: float = Field(description="回显关闭下阈值")
+    confirm_points: int = Field(description="回显连续确认点数")
+    max_gap_seconds: float = Field(description="回显最大采样间隔（秒）")
+    segment_count: int = Field(description="识别出的开启段总数")
+    total_on_duration_seconds: float = Field(
+        description="总开启时长（各开启段持续秒数之和，含截断段）"
+    )
+    normal_cycle_count: int = Field(
+        description="正常启停次数（close_reason=normal 的开启段数，即完整 开→关 周期数）"
+    )
+    gap_truncated_count: int = Field(description="因采样断档截断的开启段数")
+    end_truncated_count: int = Field(description="因序列末尾仍开启而截断的开启段数")
+    segments: list[RunCycleSegment] = Field(description="开启段列表，按时间升序")
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class SimplifyRequest(BaseModel):
     """无状态折线压缩请求（摆动门 / 斜率区间算法）。"""
 
