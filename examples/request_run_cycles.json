@@ -1,0 +1,24 @@
+{
+  "series_id": "pump-current-demo",
+  "on_threshold": 80,
+  "off_threshold": 20,
+  "confirm_points": 2,
+  "max_gap_seconds": 300,
+  "points": [
+    {"timestamp": "2026-09-22T00:00:00Z", "value": 10.0},
+    {"timestamp": "2026-09-22T00:01:00Z", "value": 90.0},
+    {"timestamp": "2026-09-22T00:02:00Z", "value": 10.0},
+    {"timestamp": "2026-09-22T00:03:00Z", "value": 85.0},
+    {"timestamp": "2026-09-22T00:04:00Z", "value": 88.0},
+    {"timestamp": "2026-09-22T00:05:00Z", "value": 50.0},
+    {"timestamp": "2026-09-22T00:06:00Z", "value": 15.0},
+    {"timestamp": "2026-09-22T00:07:00Z", "value": 18.0},
+    {"timestamp": "2026-09-22T00:08:00Z", "value": 10.0},
+    {"timestamp": "2026-09-22T00:09:00Z", "value": 90.0},
+    {"timestamp": "2026-09-22T00:10:00Z", "value": 92.0},
+    {"timestamp": "2026-09-22T00:11:00Z", "value": 90.0},
+    {"timestamp": "2026-09-22T03:00:00Z", "value": 12.0},
+    {"timestamp": "2026-09-22T03:01:00Z", "value": 86.0},
+    {"timestamp": "2026-09-22T03:02:00Z", "value": 87.0}
+  ]
+}
